@@ -35,7 +35,16 @@ jobs:
         run: ./scripts/build.ps1
 
       - name: Run WinDivert end-to-end tests
-        run: ./scripts/test-local.ps1 -Exe "$PWD/bin/flowtunnel.exe" -Results "$PWD/test-results/ci"
+        run: |
+          $exe = Join-Path $PWD 'bin/flowtunnel.exe'
+          $ruleName = 'FlowTunnel-CI-VirtualPeer-' + [Guid]::NewGuid().ToString('N')
+          New-NetFirewallRule -Name $ruleName -DisplayName 'FlowTunnel CI virtual peer' -Direction Inbound -Action Allow -Protocol TCP -RemoteAddress 10.200.0.1 -Program $exe -Profile Any | Out-Null
+          try {
+            ./scripts/test-local.ps1 -Exe $exe -Results "$PWD/test-results/ci"
+            if ($LASTEXITCODE -ne 0) { throw 'WinDivert end-to-end tests failed' }
+          } finally {
+            Remove-NetFirewallRule -Name $ruleName
+          }
 
       - name: Package release
         run: ./scripts/package-release.ps1 -Version $env:BUILD_VERSION

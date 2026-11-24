@@ -26,6 +26,7 @@ $licenseRoot = Join-Path $stageRoot 'LICENSES'
 New-Item -ItemType Directory -Path $licenseRoot | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectRoot 'third_party\WinDivert-2.2.2-A\LICENSE') -Destination (Join-Path $licenseRoot 'WinDivert.txt')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'third_party\asio-asio-1-36-0\asio\LICENSE_1_0.txt') -Destination (Join-Path $licenseRoot 'Asio.txt')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'third_party\asio-asio-1-36-0\asio\COPYING') -Destination (Join-Path $licenseRoot 'Asio-COPYING.txt')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'third_party\tomlplusplus-3.4.0\LICENSE') -Destination (Join-Path $licenseRoot 'tomlplusplus.txt')
 
 @'
