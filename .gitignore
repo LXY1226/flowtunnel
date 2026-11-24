@@ -1,0 +1,7 @@
+/bin/
+/build/
+/third_party/
+/test-results/
+*.toml
+!*.example.toml
+__pycache__/
