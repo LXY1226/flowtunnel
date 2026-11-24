@@ -1,0 +1,102 @@
+name: Windows CI and Release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build, test and package Windows x64
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BUILD_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and run native tests
+        run: ./scripts/build.ps1
+
+      - name: Run WinDivert end-to-end tests
+        run: |
+          $exe = Join-Path $PWD 'bin/flowtunnel.exe'
+          $ruleName = 'FlowTunnel-CI-VirtualPeer-' + [Guid]::NewGuid().ToString('N')
+          New-NetFirewallRule -Name $ruleName -DisplayName 'FlowTunnel CI virtual peer' -Direction Inbound -Action Allow -Protocol TCP -RemoteAddress 10.200.0.1 -Program $exe -Profile Any | Out-Null
+          try {
+            ./scripts/test-local.ps1 -Exe $exe -Results "$PWD/test-results/ci"
+            if ($LASTEXITCODE -ne 0) { throw 'WinDivert end-to-end tests failed' }
+          } finally {
+            Remove-NetFirewallRule -Name $ruleName
+          }
+
+      - name: Package release
+        run: ./scripts/package-release.ps1 -Version $env:BUILD_VERSION
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-logs
+          path: |
+            build/Testing/Temporary/LastTest.log
+            test-results/ci/*.json
+            test-results/ci/*.log
+            test-results/ci/*.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flowtunnel-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested Windows package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: flowtunnel-windows-x64
+          path: dist
+
+      - name: Publish release and assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          if [[ "$RELEASE_TAG" == v0.* || "$RELEASE_TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/*.zip dist/*.sha256 \
+            --verify-tag --title "FlowTunnel $RELEASE_TAG" --generate-notes "${flags[@]}"
