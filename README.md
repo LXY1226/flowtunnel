@@ -103,11 +103,13 @@ TCP 与 Fake TCP 共用 `127.0.0.1:18080`，测试结果、双方日志、进程
 ```powershell
 .\scripts\server-control.ps1 -Action Start
 .\scripts\server-control.ps1 -Action Probe
+.\scripts\server-control.ps1 -Action Lifetime
 .\scripts\server-control.ps1 -Action Stop
 ```
 
 该固定操作复用已注册的管理员测试入口，启动独立的最高权限任务运行服务端和测试服务。服务端监听 `0.0.0.0:31828`，Windows 防火墙规则只允许此程序的 TCP 31828 入站。
 HTTP 18082、UDP 回显 18083、TCP 回显 18084 绑定回环地址，通过虚拟 IP 访问。Stop 关闭服务端和测试进程，并清理其防火墙规则。
+Lifetime 使用独立的最高权限任务运行固定的 UDP 寿命回归，执行上限二十分钟，没有自动触发器。测试通过当前 31828 服务端访问自身的随机回环目标，持续六百六十秒检查双向、仅发送和仅接收会话的目标来源端口；随后检查应用空闲回收及恢复。结果和进度写入 `test-results\udp-lifetime`。撤销测试授权时也会删除该任务。
 客户端压缩包位于 `bin\flowtunnel-client-31828.zip`，包含相应密钥配置，按包内 README 操作。公网 TCP 31828 需要由路由器/ISP 映射到本机；本机探测不能替代公网两端验证。
 客户端启动器按实际进程识别客户端。没有对应进程的防火墙规则自动清理；已有客户端时显示 PID 和路径，由用户确认是否停止再启动。每次启动的规则独立命名，退出时只清理自己的规则。
 

@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][ValidateSet('Start','Stop','Probe')][string]$Action)
+param([Parameter(Mandatory=$true)][ValidateSet('Start','Stop','Probe','Lifetime')][string]$Action)
 $ErrorActionPreference='Stop'
 $projectRoot=Split-Path -Parent $PSScriptRoot
 $authorizationRoot=Join-Path $projectRoot 'test-results\authorization'
