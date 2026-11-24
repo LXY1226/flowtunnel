@@ -31,7 +31,7 @@ git push origin v0.1.0
 
 标签需采用 `vX.Y.Z` 或 `vX.Y.Z-rc.1` 等格式。标签对应的构建和测试全部通过后，工作流自动创建 GitHub Release，上传 `flowtunnel-<版本>-windows-x64.zip` 和 `.zip.sha256`。`v0.x.y` 及带预发布后缀的标签标记为预发布；正式版本标签从 `v1.0.0` 开始。
 
-发布包包含可执行文件、WinDivert DLL/驱动、客户端启动器、两端示例配置及第三方许可证。下载后按包内 `README.txt` 填写地址和生成的共享密钥。构建使用默认 `GITHUB_TOKEN`，发布 job 单独申请 `contents: write`，不需要额外配置 PAT。
+发布包包含可执行文件、WinDivert DLL/驱动、客户端启动器、服务安装与删除脚本、两端示例配置及第三方许可证。下载后按包内 `README.txt` 填写地址和生成的共享密钥。构建使用默认 `GITHUB_TOKEN`，发布 job 单独申请 `contents: write`，不需要额外配置 PAT。
 
 也可在本地构建通过后打包：
 
@@ -80,6 +80,21 @@ key = "<与服务端相同的密钥>"
 不要同时运行多个客户端实例；现有路由必须能发送发往 `10.200.0.1` 的 IPv4 流量。
 Ctrl+C 或进程自己的停止事件关闭进程及其 WinDivert 句柄。
 
+## Windows 服务与开机启动
+
+将发布包解压到固定目录并填好配置后，在管理员 PowerShell 中安装。服务以 LocalSystem 运行，安装成功后立即启动，并设置为系统开机自动启动。客户端和服务端使用同一脚本，以配置中的 `mode` 决定角色；同一台机器只运行一个客户端实例。
+
+```powershell
+.\install-service.ps1 -ConfigPath "$PWD\client.toml"
+# 服务端也可使用：.\install-service.ps1 -ConfigPath "$PWD\server.toml"
+Get-Service FlowTunnel
+Stop-Service FlowTunnel
+Start-Service FlowTunnel
+.\remove-service.ps1
+```
+
+源码目录运行时显式指定 `-ExecutablePath "$PWD\bin\flowtunnel.exe"`。可通过 `-Name FlowTunnel-Client` 等名称安装不同角色；删除时使用同一个 `-Name`。安装脚本按角色创建所属防火墙规则，删除脚本停止服务并删除该规则，保留配置和日志。服务日志默认追加到配置所在目录的 `logs\<服务名>\stdout.log` 和 `stderr.log`，可用 `-LogDirectory` 指定绝对路径。安装后应保持可执行文件、WinDivert DLL/驱动及配置路径不变。
+
 ## 本地双端测试
 
 在管理员 PowerShell 中执行：
@@ -109,7 +124,8 @@ TCP 与 Fake TCP 共用 `127.0.0.1:18080`，测试结果、双方日志、进程
 - 两种传输均发送固定 HTTP 首包，Host 为 `speedtest.fkcucc.com`；之后使用独立方向的 AES-128-GCM 密钥。HTTP 首包后的内容不是完整 HTTP 会话，实际 ISP QoS 放行效果需要链路测试。
 - HMAC-SHA256 认证握手，HKDF-SHA256 派生会话密钥；计数器和 nonce 按方向独立，UDP 使用 1024 个记录的滑动重放窗口。TCP 在服务端随机挑战后验证客户端的加密确认，才连接目标；UDP 在完整数据报通过新会话认证后才打开目标 socket。PSK 握手没有前向保密。
 - UDP 数据无外层可靠重传。握手可重试，数据报分片独立认证；缺片、重叠、超时及超出限额的数据报不交付应用。
-- Fake TCP 对通过认证的数据和控制记录发送 ACK，保持 NAT/状态防火墙的 TCP 窗口推进；乱序数据不会使 ACK 回退。通过认证的重复记录只补发当前 ACK，不重复交付应用。
+- Fake TCP 对认证过的数据和控制记录延迟确认：累计序列进度达到 16 KiB，或首次待确认记录后经过 10 ms，先到者发送纯 ACK。期间发出的数据或控制包携带 `PSH|ACK`，成功发送后取消待发纯 ACK；纯 ACK 不触发 ACK。认证重复记录按相同策略限频，不重复交付应用。
+- ACK 表示最高已观察到的序列末端，允许越过丢失片段；乱序不会使它回退。数据发送及应用交付不等待 ACK，没有发送窗口、载荷重传或按序等待。握手可重试且复用原序列范围，不影响后续数据序号。
 - 本地 IPv4 分片先重组，再提取 UDP 载荷；隧道分片重组限制为每会话 64 个未完成数据报、1 MiB，3 秒超时。
 - UDP 初始分片载荷 1100 字节，每 15 秒发送认证过的 1400/1500 字节路径探测；仅确认后提高载荷，下一轮恢复保守基线。探测超时不会触发数据重传。低于保守基线的路径、ICMP 错误反馈及更完整的 DPLPMTUD 黑洞恢复仍需扩展和跨机测试。
 - 正常分片包含 13 字节数据报元数据、24 字节认证加密记录和 40 字节 IPv4/TCP 包头，共 77 字节开销。握手另有 TCP option，未复用旧方案中的 64 字节预算。
@@ -117,7 +133,7 @@ TCP 与 Fake TCP 共用 `127.0.0.1:18080`，测试结果、双方日志、进程
 
 ## 当前边界
 
-仅支持客户端主动访问服务端本机 IPv4 TCP/UDP。ICMP、IPv6、广播、服务端主动连接客户端、保留原始来源 IP、GUI、Windows 服务安装，以及生产性能优化不在本原型中。
+仅支持客户端主动访问服务端本机 IPv4 TCP/UDP。ICMP、IPv6、广播、服务端主动连接客户端、保留原始来源 IP、GUI，以及进一步的生产性能优化不在本原型中。
 加密算法使用 Windows CNG 实现；自定义握手、记录格式和 Fake TCP 状态机尚未经过第三方安全审查。
 本地双端通过只能证明当前机器上的数据路径，不能替代两台机器、真实 NAT/防火墙、动态公网 IP 变化及 ISP 链路验证。
 

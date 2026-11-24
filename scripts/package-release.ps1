@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
 foreach ($name in @('flowtunnel.exe', 'WinDivert.dll', 'WinDivert64.sys')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot ('bin\' + $name)) -Destination $stageRoot
 }
-foreach ($name in @('launch-client.ps1', 'client-process.ps1')) {
+foreach ($name in @('launch-client.ps1', 'client-process.ps1', 'install-service.ps1', 'remove-service.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $stageRoot
 }
 foreach ($name in @('client.example.toml', 'server.example.toml')) {
@@ -50,6 +50,16 @@ Server setup:
 3. Allow the configured inbound TCP port in Windows Firewall and forward it
    through the router if needed. The target services must listen on loopback
    or all IPv4 addresses. No public UDP port is required.
+
+Windows service (client or server, in Administrator PowerShell):
+1. Keep this package in a fixed folder and prepare client.toml or server.toml.
+2. Run .\install-service.ps1 -ConfigPath "`$PWD\client.toml"
+   For a server use server.toml. The service starts immediately as LocalSystem
+   and is configured for automatic startup at boot.
+3. Use Get-Service FlowTunnel, Stop-Service FlowTunnel, or Start-Service FlowTunnel.
+4. Run .\remove-service.ps1 to stop and remove the service and its firewall rule.
+   Configuration and logs are preserved. Default logs are logs\FlowTunnel\stdout.log
+   and stderr.log beside the configuration. Stop a console client before installing.
 
 Both roles use the same executable. Windows x64 and Administrator privileges
 are required for WinDivert. MSVC runtime libraries are linked statically.

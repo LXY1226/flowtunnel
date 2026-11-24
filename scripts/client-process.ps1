@@ -18,8 +18,17 @@ function Get-FlowTunnelClientProcess {
             $command = [string]$current.CommandLine
             if ($command -match '^\s*(?:"[^"]+"|\S+)\s+(?:genkey|check)\b') { continue }
             $run = [regex]::Match($command, '^\s*(?:"[^"]+"|\S+)\s+(?:run|"run")\s+(?:"(?<config>[^"]+)"|(?<config>\S+))\s*$')
-            if (-not $run.Success) { throw 'Run configuration is unavailable' }
-            $configPath = $run.Groups['config'].Value
+            $serviceName = $null
+            if ($run.Success) {
+                $configPath = $run.Groups['config'].Value
+            } else {
+                $service = [regex]::Match($command, '^\s*(?:"[^"]+"|\S+)\s+(?:service|"service")\s+(?:"(?<name>FlowTunnel[-_.A-Za-z0-9]*)"|(?<name>FlowTunnel[-_.A-Za-z0-9]*))\s+(?:"(?<config>[^"]+)"|(?<config>\S+))\s+(?:"[^"]*"|\S+)\s*$')
+                if (-not $service.Success) { throw 'Native run or service configuration is unavailable' }
+                $serviceName = $service.Groups['name'].Value
+                $registered = Get-CimInstance -ClassName Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
+                if (-not $registered -or [int]$registered.ProcessId -ne $process.Id) { throw 'Service process identity is unavailable' }
+                $configPath = $service.Groups['config'].Value
+            }
             if (-not [IO.Path]::IsPathRooted($configPath)) { throw 'Run configuration path is not absolute' }
             $configPath = [IO.Path]::GetFullPath($configPath)
             $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 -ErrorAction Stop
@@ -33,6 +42,7 @@ function Get-FlowTunnelClientProcess {
                 ConfigPath = $configPath
                 CreationDate = $current.CreationDate
                 Process = $process
+                ServiceName = $serviceName
             })
             $retained = $true
         } catch {
@@ -58,6 +68,20 @@ function Stop-FlowTunnelClientProcess {
     if ($process.HasExited) { return }
     if (-not [string]::Equals($process.MainModule.FileName, $Client.ExecutablePath, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Client process identity does not match PID $($Client.Id)"
+    }
+    if ($Client.ServiceName) {
+        if ($Client.ServiceName -cnotmatch '^FlowTunnel[-_.A-Za-z0-9]*$') { throw 'Client service name is invalid' }
+        $registered = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($Client.ServiceName)'" -ErrorAction Stop
+        if (-not $registered -or [int]$registered.ProcessId -ne $Client.Id) { throw 'Client service process identity changed' }
+        $controller = Get-Service -Name $Client.ServiceName -ErrorAction Stop
+        try {
+            Stop-Service -InputObject $controller -ErrorAction Stop
+            $controller.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(30))
+            if (-not $process.WaitForExit(30000)) { throw 'Client service process did not exit after SCM stop' }
+        } finally {
+            $controller.Dispose()
+        }
+        return
     }
     $event = $null
     try {

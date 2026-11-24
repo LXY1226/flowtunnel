@@ -1,5 +1,6 @@
 #include "tunnel.hpp"
 #include "divert.hpp"
+#include "datagram_ack.hpp"
 #include "packet.hpp"
 #include "stream.hpp"
 #include <bcrypt.h>
@@ -147,7 +148,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
     Tuple tuple{};
     Flow flow{};
     WINDIVERT_ADDRESS address{};
-    bool server = false, closed = false;
+    bool server = false, closed = false, handshake_sent = false;
     enum Phase
     {
         Resolving,
@@ -157,6 +158,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
         ServerPending
     } phase;
     uint32_t isn = random32(), seq = isn + 1, ack = 0;
+    DatagramAck acknowledgments;
     uint64_t id = 0;
     size_t chunk = 1100, queued_bytes = 0;
     uint16_t target_port = 0;
@@ -171,7 +173,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
     tcp::acceptor reservation;
     udp::socket target;
     udp::resolver resolver;
-    asio::steady_timer timer;
+    asio::steady_timer timer, ack_timer;
 
     DatagramFlow(Impl &root, bool is_server) :
         owner(root),
@@ -180,18 +182,72 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
         reservation(root.strand),
         target(root.strand),
         resolver(root.strand),
-        timer(root.strand)
+        timer(root.strand),
+        ack_timer(root.strand)
     {
     }
-    void raw(std::span<const uint8_t> body, uint8_t flags, bool syn = false)
+    void
+    raw(std::span<const uint8_t> body, uint8_t flags, bool syn = false, std::optional<uint32_t> sequence = std::nullopt)
     {
         auto packet = tcp_packet(
-            tuple.local, tuple.remote, tuple.local_port, tuple.remote_port, syn ? isn : seq, ack, flags, body, syn);
-        if (!syn)
-            seq += static_cast<uint32_t>(body.size());
+            tuple.local,
+            tuple.remote,
+            tuple.local_port,
+            tuple.remote_port,
+            sequence.value_or(syn ? isn : seq),
+            ack,
+            flags,
+            body,
+            syn);
         auto out = address;
         out.Outbound = 1;
         owner.inject->send(packet, out);
+        if (!syn && !sequence)
+            seq += static_cast<uint32_t>(body.size());
+        if ((flags & Ack) && acknowledgments.pending())
+        {
+            acknowledgments.sent();
+            ack_timer.cancel();
+        }
+    }
+    void handshake_record(std::span<const uint8_t> body)
+    {
+        raw(body, Psh | Ack, false, isn + 1);
+        if (!handshake_sent)
+        {
+            seq = isn + 1 + static_cast<uint32_t>(body.size());
+            handshake_sent = true;
+        }
+    }
+    void acknowledge(const Packet &packet)
+    {
+        const auto now = Clock::now();
+        const bool pending = acknowledgments.pending();
+        const bool due = acknowledgments.observe(packet.seq + static_cast<uint32_t>(packet.payload().size()), now);
+        ack = acknowledgments.sequence();
+        if (due)
+        {
+            raw({}, Ack);
+            return;
+        }
+        if (pending)
+            return;
+        ack_timer.expires_at(*acknowledgments.deadline());
+        auto self = shared_from_this();
+        ack_timer.async_wait([self](std::error_code error) {
+            if (error || self->closed)
+                return;
+            try
+            {
+                if (self->acknowledgments.due(Clock::now()))
+                    self->raw({}, Ack);
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr << "UDP acknowledgment: " << error.what() << std::endl;
+                self->close();
+            }
+        });
     }
     void encrypted(std::span<const uint8_t> body)
     {
@@ -213,6 +269,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
         closed = true;
         std::error_code ec;
         timer.cancel();
+        ack_timer.cancel();
         resolver.cancel();
         reservation.close(ec);
         target.close(ec);
@@ -291,7 +348,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
         if (phase == SynSent)
             raw({}, 2, true);
         if (phase == HelloSent)
-            raw(prefixed(RequestPrefix, hello), 0x18);
+            handshake_record(prefixed(RequestPrefix, hello));
     }
     void packet(const Packet &packet)
     {
@@ -307,7 +364,6 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
             if ((packet.flags & 0x12) == 0x12 && packet.ack == isn + 1)
             {
                 ack = packet.seq + 1;
-                raw({}, 0x10);
                 phase = HelloSent;
                 attempts = 0;
                 handshake();
@@ -324,7 +380,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
             {
                 if (!std::equal(request.begin(), request.end(), hello.begin(), hello.end()))
                     throw std::runtime_error("unexpected UDP handshake");
-                raw(response, 0x18);
+                handshake_record(response);
                 return;
             }
             auto info = verify_client_hello(owner.config.key, request);
@@ -336,8 +392,9 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
             session = std::move(accepted.session);
             response = prefixed(ResponsePrefix, accepted.response);
             ack = packet.seq + static_cast<uint32_t>(body.size());
+            acknowledgments.reset(ack);
             last = Clock::now();
-            raw(response, 0x18);
+            handshake_record(response);
             return;
         }
         if (!server && phase == HelloSent)
@@ -346,6 +403,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
             {
                 session = client_session(owner.config.key, hello, body.subspan(ResponsePrefix.size()));
                 ack = packet.seq + static_cast<uint32_t>(body.size());
+                acknowledgments.reset(ack);
                 established();
             }
             return;
@@ -359,18 +417,14 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
         }
         catch (const ReplayError &)
         {
-            raw({}, Ack);
+            acknowledge(packet);
             return;
         }
         if (plain.empty())
             throw std::runtime_error("empty UDP record");
         phase = Established;
-        const auto next_ack = packet.seq + static_cast<uint32_t>(body.size());
-        if (static_cast<int32_t>(next_ack - ack) > 0)
-            ack = next_ack;
         last = Clock::now();
-        // Stateful TCP middleboxes need acknowledgments for control records as well as data.
-        raw({}, Ack);
+        acknowledge(packet);
         switch (plain[0])
         {
         case 1: {

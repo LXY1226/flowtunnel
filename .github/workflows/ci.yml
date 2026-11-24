@@ -42,6 +42,8 @@ jobs:
           try {
             ./scripts/test-local.ps1 -Exe $exe -Results "$PWD/test-results/ci"
             if ($LASTEXITCODE -ne 0) { throw 'WinDivert end-to-end tests failed' }
+            python -u tests/datagram_wire.py --exe $exe --results "$PWD/test-results/ci-wire"
+            if ($LASTEXITCODE -ne 0) { throw 'Fake TCP wire tests failed' }
           } finally {
             Remove-NetFirewallRule -Name $ruleName
           }
@@ -59,6 +61,8 @@ jobs:
             test-results/ci/*.json
             test-results/ci/*.log
             test-results/ci/*.txt
+            test-results/ci-wire/*.json
+            test-results/ci-wire/*.log
           if-no-files-found: ignore
           retention-days: 14
 

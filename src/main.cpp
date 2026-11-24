@@ -1,25 +1,78 @@
 #include "tunnel.hpp"
+#include "service.hpp"
 #include <windows.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
 #include <toml++/toml.hpp>
 #include <algorithm>
 #include <charconv>
+#include <filesystem>
 #include <iostream>
+#include <mutex>
+#include <system_error>
 #include <thread>
 
 namespace {
 HANDLE stop_event = nullptr;
+std::mutex stop_mutex;
+void
+request_stop()
+{
+    std::lock_guard lock(stop_mutex);
+    if (stop_event)
+        SetEvent(stop_event);
+}
 BOOL WINAPI
 console_handler(DWORD type)
 {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT || type == CTRL_SHUTDOWN_EVENT)
     {
-        SetEvent(stop_event);
+        request_stop();
         return TRUE;
     }
     return FALSE;
 }
+class StopEvent
+{
+public:
+    StopEvent()
+    {
+        const auto name = L"Local\\FlowTunnel.Stop." + std::to_wstring(GetCurrentProcessId());
+        handle_ = CreateEventW(nullptr, TRUE, FALSE, name.c_str());
+        if (!handle_)
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "create shutdown event");
+        std::lock_guard lock(stop_mutex);
+        stop_event = handle_;
+    }
+    ~StopEvent()
+    {
+        std::lock_guard lock(stop_mutex);
+        stop_event = nullptr;
+        CloseHandle(handle_);
+    }
+    HANDLE handle() const { return handle_; }
+
+private:
+    HANDLE handle_ = nullptr;
+};
+class ConsoleControl
+{
+public:
+    explicit ConsoleControl(bool enabled) : enabled_(enabled)
+    {
+        if (enabled_ && !SetConsoleCtrlHandler(console_handler, TRUE))
+            throw std::system_error(
+                static_cast<int>(GetLastError()), std::system_category(), "register console handler");
+    }
+    ~ConsoleControl()
+    {
+        if (enabled_)
+            SetConsoleCtrlHandler(console_handler, FALSE);
+    }
+
+private:
+    bool enabled_;
+};
 std::string
 base64(const ft::Key &key)
 {
@@ -53,9 +106,9 @@ decode_key(const std::string &text)
     return key;
 }
 ft::Config
-configuration(const char *path)
+configuration(const wchar_t *path)
 {
-    auto table = toml::parse_file(path);
+    auto table = toml::parse_file(std::wstring_view(path));
     for (auto &[name, value] : table)
         if (name != "mode" && name != "listen" && name != "endpoint" && name != "key")
             throw std::runtime_error("unknown configuration field: " + std::string(name.str()));
@@ -86,14 +139,69 @@ configuration(const char *path)
         throw std::runtime_error("endpoint must be a reachable server address");
     return { server, std::move(address), decode_key(require("key")) };
 }
+
+int
+run_runtime(ft::Config config, const std::function<void()> &on_started, bool console)
+{
+    asio::io_context io;
+    ft::Runtime runtime(io, std::move(config));
+    StopEvent event;
+    ConsoleControl control(console);
+    runtime.start();
+    std::mutex failure_mutex;
+    std::exception_ptr failure;
+    auto record_failure = [&] {
+        std::lock_guard lock(failure_mutex);
+        if (!failure)
+            failure = std::current_exception();
+    };
+    auto run_io = [&] {
+        for (;;)
+            try
+            {
+                io.run();
+                return;
+            }
+            catch (...)
+            {
+                record_failure();
+                runtime.stop();
+            }
+    };
+    std::vector<std::jthread> workers;
+    std::jthread stopper([&] {
+        WaitForSingleObject(event.handle(), INFINITE);
+        runtime.stop();
+    });
+    try
+    {
+        on_started();
+        const unsigned count = std::clamp(std::thread::hardware_concurrency(), 2u, 4u);
+        for (unsigned i = 1; i < count; i++)
+            workers.emplace_back(run_io);
+        run_io();
+    }
+    catch (...)
+    {
+        record_failure();
+        runtime.stop();
+        run_io();
+    }
+    request_stop();
+    stopper.join();
+    workers.clear();
+    if (failure)
+        std::rethrow_exception(failure);
+    return runtime.failed() ? 1 : 0;
+}
 } // namespace
 
 int
-main(int argc, char **argv)
+wmain(int argc, wchar_t **argv)
 {
     try
     {
-        if (argc == 2 && std::string_view(argv[1]) == "genkey")
+        if (argc == 2 && std::wstring_view(argv[1]) == L"genkey")
         {
             ft::Key key;
             if (BCryptGenRandom(nullptr, key.data(), static_cast<ULONG>(key.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) <
@@ -102,45 +210,33 @@ main(int argc, char **argv)
             std::cout << base64(key) << '\n';
             return 0;
         }
-        if (argc != 3 || (std::string_view(argv[1]) != "run" && std::string_view(argv[1]) != "check"))
-            throw std::runtime_error("usage: flowtunnel genkey | check <config.toml> | run <config.toml>");
-        auto config = configuration(argv[2]);
-        if (std::string_view(argv[1]) == "check")
+        if (argc == 5 && std::wstring_view(argv[1]) == L"service")
         {
-            std::cout << "configuration valid\n";
+            return ft::run_service(
+                argv[2],
+                argv[4],
+                [&](const auto &started) {
+                    if (!std::filesystem::path(argv[3]).is_absolute())
+                        throw std::runtime_error("service configuration path must be absolute");
+                    return run_runtime(configuration(argv[3]), started, false);
+                },
+                request_stop);
+        }
+        if (argc != 3 || (std::wstring_view(argv[1]) != L"run" && std::wstring_view(argv[1]) != L"check"))
+            throw std::runtime_error(
+                "usage: flowtunnel genkey | check <config.toml> | run <config.toml> | service <service-name> <config.toml> <log-directory>");
+        auto config = configuration(argv[2]);
+        if (std::wstring_view(argv[1]) == L"check")
+        {
+            const auto port = std::stoi(config.address.substr(config.address.rfind(':') + 1));
+            std::cout << "{\"mode\":\"" << (config.server ? "server" : "client") << "\",\"port\":" << port << "}\n";
             return 0;
         }
-        asio::io_context io;
-        ft::Runtime runtime(io, std::move(config));
-        auto event_name = L"Local\\FlowTunnel.Stop." + std::to_wstring(GetCurrentProcessId());
-        stop_event = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
-        if (!stop_event)
-            throw std::runtime_error("create shutdown event failed");
-        SetConsoleCtrlHandler(console_handler, TRUE);
-        runtime.start();
-        std::thread stopper([&] {
-            WaitForSingleObject(stop_event, INFINITE);
-            runtime.stop();
-        });
-        unsigned count = std::clamp(std::thread::hardware_concurrency(), 2u, 4u);
-        std::vector<std::thread> workers;
-        for (unsigned i = 1; i < count; i++)
-            workers.emplace_back([&] { io.run(); });
-        io.run();
-        SetEvent(stop_event);
-        stopper.join();
-        for (auto &worker : workers)
-            worker.join();
-        SetConsoleCtrlHandler(console_handler, FALSE);
-        CloseHandle(stop_event);
-        stop_event = nullptr;
-        return runtime.failed() ? 1 : 0;
+        return run_runtime(std::move(config), [] {}, true);
     }
     catch (const std::exception &error)
     {
         std::cerr << "fatal: " << error.what() << std::endl;
-        if (stop_event)
-            CloseHandle(stop_event);
         return 1;
     }
 }
