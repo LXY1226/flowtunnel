@@ -1,0 +1,3 @@
+mode = "client"
+endpoint = "your-server.example.com:31828"
+key = "<shared 32-byte key from flowtunnel.exe genkey>"

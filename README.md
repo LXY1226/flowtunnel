@@ -1,5 +1,7 @@
 # FlowTunnel
 
+[![Windows CI and Release](https://github.com/LXY1226/flowtunnel/actions/workflows/ci.yml/badge.svg)](https://github.com/LXY1226/flowtunnel/actions/workflows/ci.yml)
+
 Windows IPv4 透明 L4 隧道原型。客户端通过固定地址 `10.200.0.1` 访问服务端本机的 TCP 和 UDP 端口。
 每条 TCP 连接使用独立的原生 TCP 字节流，每个 UDP 五元组使用独立 Fake TCP 会话；两者共用一个服务端 TCP 端口。
 
@@ -15,6 +17,27 @@ Windows IPv4 透明 L4 隧道原型。客户端通过固定地址 `10.200.0.1` �
 验证驱动 Authenticode 签名，以 MSVC/CMake 构建 C++20 程序并执行 CTest，然后生成 `bin\flowtunnel.exe`、`WinDivert.dll` 和 `WinDivert64.sys`。
 TCP 异步 I/O 使用 Asio 1.36.0，配置解析使用 toml++ 3.4.0，加密使用 Windows CNG。依赖版本固定，源码归档校验 SHA-256。
 依赖包和构建输出位于忽略目录，不修改上层 WireGuard 源码。
+
+## CI 与自动发布
+
+每次分支推送、针对 `main` 的 PR 和手动触发都会在 GitHub 托管的 Windows x64 / VS 2026 环境中构建，运行原生 CTest 和 WinDivert 双端测试，然后上传 ZIP 与 SHA-256 校验文件。测试失败会阻止打包和发布，测试日志保留 14 天。
+
+发布新版本时推送版本标签：
+
+```powershell
+git tag -a v0.1.0 -m "FlowTunnel v0.1.0"
+git push origin v0.1.0
+```
+
+标签需采用 `vX.Y.Z` 或 `vX.Y.Z-rc.1` 等格式。标签对应的构建和测试全部通过后，工作流自动创建 GitHub Release，上传 `flowtunnel-<版本>-windows-x64.zip` 和 `.zip.sha256`。`v0.x.y` 及带预发布后缀的标签标记为预发布；正式版本标签从 `v1.0.0` 开始。
+
+发布包包含可执行文件、WinDivert DLL/驱动、客户端启动器、两端示例配置及第三方许可证。下载后按包内 `README.txt` 填写地址和生成的共享密钥。构建使用默认 `GITHUB_TOKEN`，发布 job 单独申请 `contents: write`，不需要额外配置 PAT。
+
+也可在本地构建通过后打包：
+
+```powershell
+.\scripts\package-release.ps1 -Version v0.1.0
+```
 
 ## 配置与运行
 
