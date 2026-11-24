@@ -161,7 +161,8 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
     size_t chunk = 1100, queued_bytes = 0;
     uint16_t target_port = 0;
     unsigned attempts = 0;
-    Clock::time_point created = Clock::now(), last = created, last_probe = created - 15s, last_handshake = created - 1s;
+    Clock::time_point created = Clock::now(), last = created, last_datagram = created,
+                      last_probe = created - 15s, last_handshake = created - 1s;
     Bytes hello, response;
     std::shared_ptr<Session> session;
     DatagramAssembler assembler;
@@ -222,6 +223,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
     }
     void submit(std::span<const uint8_t> data)
     {
+        last_datagram = Clock::now();
         if (phase == Established)
         {
             send_datagram(data);
@@ -234,6 +236,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
     }
     void send_datagram(std::span<const uint8_t> data)
     {
+        last_datagram = Clock::now();
         for (auto &part : split_datagram(data, ++id, chunk))
             encrypted(part);
     }
@@ -374,6 +377,7 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
             auto data = assembler.add(plain);
             if (data)
             {
+                last_datagram = Clock::now();
                 if (server)
                 {
                     if (!target.is_open())
@@ -381,7 +385,8 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
                         target.open(udp::v4());
                         target.connect({ asio::ip::address_v4::loopback(), target_port });
                         std::cout << "UDP connected peer=" << asio::ip::address_v4(tuple.remote) << ':'
-                                  << tuple.remote_port << " target=" << target_port << std::endl;
+                                  << tuple.remote_port << " target=" << target_port
+                                  << " target_local_port=" << target.local_endpoint().port() << std::endl;
                         auto self = shared_from_this();
                         asio::co_spawn(owner.strand, read_target(), [self](std::exception_ptr error) {
                             if (error && !self->closed)
@@ -464,8 +469,20 @@ struct Runtime::Impl::DatagramFlow : std::enable_shared_from_this<DatagramFlow>
             if (closed)
                 co_return;
             auto now = Clock::now();
-            if (now - created > 10min || now - last > 2min || (phase == ServerPending && now - created > 5s))
+            const char *reason = nullptr;
+            if (phase == ServerPending && now - created > 5s)
+                reason = "handshake_timeout";
+            else if (now - last > 2min)
+                reason = "peer_timeout";
+            else if (now - last_datagram > 2min)
+                reason = "application_idle";
+            if (reason)
             {
+                std::cout << "UDP expired peer=" << asio::ip::address_v4(tuple.remote) << ':' << tuple.remote_port
+                          << " target=" << (server ? target_port : flow.target_port)
+                          << " age_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(now - created).count()
+                          << " idle_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(now - last_datagram).count()
+                          << " reason=" << reason << std::endl;
                 close();
                 co_return;
             }
